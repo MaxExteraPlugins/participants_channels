@@ -21,7 +21,7 @@
 
 **Participants Channels** plugin for **exteraGram** and **AyuGram** clients.
 
-Adds a native Channels tab to group and channel profiles showing participants' personal channels.
+View public channels and groups linked to chat members.
 
 ---
 
