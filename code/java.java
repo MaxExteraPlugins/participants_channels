@@ -28,6 +28,7 @@ import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.ChatObject;
 import org.telegram.messenger.LocaleController;
 import org.telegram.messenger.MessagesController;
+import org.telegram.messenger.MessagesStorage;
 import org.telegram.messenger.R;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.UserObject;
@@ -51,6 +52,7 @@ import org.telegram.ui.ProfileActivity;
 
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -60,7 +62,10 @@ import java.util.Set;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class Main {
 
@@ -72,17 +77,17 @@ public class Main {
     private static volatile boolean loaded = false;
 
     // Config settings
-    private static volatile boolean loadFromHistory = false;
+    private static volatile boolean loadFromHistory = true;
     private static volatile boolean onlyIfHidden = false;
-    private static volatile int historyLimit = 100;
+    private static volatile int historyLimit = 300;
     private static volatile String lang = "ru";
 
     // Discovered channels per chat (dialogId -> list of entries)
     private static final Map<Long, List<ChannelEntry>> chatChannels = new ConcurrentHashMap<>();
     // Global user -> personal channel mapping cache
     private static final Map<Long, Long> userChannelCache = new ConcurrentHashMap<>();
-    // Global negative cache: users known to have no personal channel
-    private static final Set<Long> noChannelCache = Collections.newSetFromMap(new ConcurrentHashMap<Long, Boolean>());
+    // In-memory negative cache with TTL (uid -> expireTimeMs)
+    private static final Map<Long, Long> noChannelUntil = new ConcurrentHashMap<>();
     // Chats currently undergoing active scan
     private static final Set<Long> scanningChats = Collections.newSetFromMap(new ConcurrentHashMap<Long, Boolean>());
     // Scan timestamps to avoid scanning too frequently
@@ -90,11 +95,15 @@ public class Main {
 
     // Weak map of attached custom views for each SharedMediaLayout
     private static final WeakHashMap<SharedMediaLayout, ChannelsLayout> layouts = new WeakHashMap<>();
+    private static final WeakHashMap<SharedMediaLayout, ProfileActivity> smlToProfile = new WeakHashMap<>();
+    private static final ExecutorService scanExecutor = Executors.newSingleThreadExecutor();
 
     // Reflection caches
     private static Field smlDialogIdField;
     private static Field smlProfileActivityField;
     private static Field paMediaCounterField;
+    private static Method paSetMediaCounterTextMethod;
+    private static boolean paSetMediaCounterTextChecked = false;
     private static Field tabStripDelegateField;
     private static Field smlMediaPagesField;
 
@@ -198,12 +207,10 @@ public class Main {
                 TLRPC.Chat chat = mc.getChat(-dialogId);
                 if (chat == null) return;
 
-                boolean isGroup = !ChatObject.isChannel(chat) || chat.megagroup;
-                TLRPC.ChatFull cf = mc.getChatFull(-dialogId);
-                boolean hasLinked = cf != null && cf.linked_chat_id != 0;
-                boolean isChannelWithAccess = ChatObject.isChannel(chat) && (chat.creator || chat.admin_rights != null || hasLinked);
+                boolean isChannel = ChatObject.isChannel(chat) && !chat.megagroup;
+                boolean hasAdminInChannel = chat.creator || ChatObject.hasAdminRights(chat) || chat.admin_rights != null;
 
-                if (!isGroup && !isChannelWithAccess) {
+                if (isChannel && !hasAdminInChannel) {
                     return;
                 }
 
@@ -214,6 +221,13 @@ public class Main {
                         tabStrip.addTextTab(TAB_ID, getTabTitle(dialogId));
                         tabStrip.finishAddingTabs();
                     }
+                    if (isOurTabActive(sml)) {
+                        tabStrip.selectTabWithId(TAB_ID, 1.0f);
+                        BaseFragment pa = getProfileActivity(sml);
+                        if (pa instanceof ProfileActivity && isOurTabActive(sml)) {
+                            updateProfileCounter((ProfileActivity) pa, sml, dialogId);
+                        }
+                    }
                 }
 
                 ensureScanStarted(dialogId, account);
@@ -223,12 +237,21 @@ public class Main {
         }
     };
 
+    private static boolean isOurTabActive(SharedMediaLayout sml) {
+        if (sml == null) return false;
+        ChannelsLayout layout = layouts.get(sml);
+        if (layout != null && layout.getVisibility() == View.VISIBLE) {
+            return true;
+        }
+        return sml.scrollSlidingTextTabStrip != null && sml.scrollSlidingTextTabStrip.getCurrentTabId() == TAB_ID;
+    }
+
     private static final XC_MethodHook getCurrentListViewHook = new XC_MethodHook() {
         @Override
         public void beforeHookedMethod(MethodHookParam param) {
             try {
                 SharedMediaLayout sml = (SharedMediaLayout) param.thisObject;
-                if (sml.scrollSlidingTextTabStrip != null && sml.scrollSlidingTextTabStrip.getCurrentTabId() == TAB_ID) {
+                if (isOurTabActive(sml)) {
                     ChannelsLayout layout = layouts.get(sml);
                     if (layout != null) {
                         param.setResult(layout.listView);
@@ -257,15 +280,38 @@ public class Main {
 
     private static final XC_MethodHook updateCounterHook = new XC_MethodHook() {
         @Override
+        public void beforeHookedMethod(MethodHookParam param) {
+            try {
+                ProfileActivity pa = (ProfileActivity) param.thisObject;
+                SharedMediaLayout sml = pa.sharedMediaLayout;
+                if (sml != null) {
+                    smlToProfile.put(sml, pa);
+                }
+                if (isOurTabActive(sml)) {
+                    long dialogId = getDialogId(sml);
+                    updateProfileCounter(pa, sml, dialogId);
+                    param.setResult(null);
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "Error in updateCounterHook before", t);
+            }
+        }
+
+        @Override
         public void afterHookedMethod(MethodHookParam param) {
             try {
                 ProfileActivity pa = (ProfileActivity) param.thisObject;
                 SharedMediaLayout sml = pa.sharedMediaLayout;
-                if (sml != null && sml.scrollSlidingTextTabStrip != null && sml.scrollSlidingTextTabStrip.getCurrentTabId() == TAB_ID) {
+                if (sml != null) {
+                    smlToProfile.put(sml, pa);
+                }
+                if (isOurTabActive(sml)) {
                     long dialogId = getDialogId(sml);
                     updateProfileCounter(pa, sml, dialogId);
                 }
-            } catch (Throwable ignored) {}
+            } catch (Throwable t) {
+                Log.e(TAG, "Error in updateCounterHook after", t);
+            }
         }
     };
 
@@ -291,6 +337,9 @@ public class Main {
             }
 
             if (id == TAB_ID) {
+                if (sml.scrollSlidingTextTabStrip != null) {
+                    sml.scrollSlidingTextTabStrip.selectTabWithId(TAB_ID, 1.0f);
+                }
                 onOurTabSelected(sml);
             } else {
                 onOtherTabSelected(sml, id);
@@ -411,13 +460,26 @@ public class Main {
                     layout.setVisibility(View.VISIBLE);
                     layout.bringToFront();
                     if (sml.scrollSlidingTextTabStrip != null) {
+                        sml.scrollSlidingTextTabStrip.selectTabWithId(TAB_ID, 1.0f);
                         sml.scrollSlidingTextTabStrip.bringToFront();
                     }
                     layout.updateData();
 
                     if (pa instanceof ProfileActivity) {
-                        ((ProfileActivity) pa).scrollToSharedMedia(true);
-                        updateProfileCounter((ProfileActivity) pa, sml, dialogId);
+                        final ProfileActivity profile = (ProfileActivity) pa;
+                        profile.scrollToSharedMedia(true);
+                        updateProfileCounter(profile, sml, dialogId);
+                        AndroidUtilities.runOnUIThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (isOurTabActive(sml)) {
+                                    if (sml.scrollSlidingTextTabStrip != null) {
+                                        sml.scrollSlidingTextTabStrip.selectTabWithId(TAB_ID, 1.0f);
+                                    }
+                                    updateProfileCounter(profile, sml, dialogId);
+                                }
+                            }
+                        }, 150);
                     }
 
                     ensureScanStarted(dialogId, account);
@@ -703,7 +765,7 @@ public class Main {
         lastScanTime.put(dialogId, SystemClock.elapsedRealtime());
         notifyChannelsUpdated(dialogId);
 
-        Utilities.globalQueue.postRunnable(new Runnable() {
+        scanExecutor.execute(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -730,14 +792,9 @@ public class Main {
 
         if (isChannel && !chat.megagroup) {
             // Broadcast channel
-            boolean hasAdmin = chat.creator || chat.admin_rights != null;
+            boolean hasAdmin = chat.creator || ChatObject.hasAdminRights(chat) || chat.admin_rights != null;
             if (!hasAdmin) {
-                TLRPC.ChatFull cf = mc.getChatFull(chatId);
-                if (cf != null && cf.linked_chat_id != 0) {
-                    scanTargetId = cf.linked_chat_id;
-                } else {
-                    return;
-                }
+                return;
             }
         }
 
@@ -798,10 +855,23 @@ public class Main {
             }
         }
 
-        // Phase 2: Recent Members (pages of 200, up to 600 members)
+        // Phase 2: History Search (active chatters first, if enabled)
+        if (loadFromHistory) {
+            boolean shouldSearchHistory = true;
+            if (onlyIfHidden) {
+                TLRPC.ChatFull cf = mc.getChatFull(scanTargetId);
+                shouldSearchHistory = cf != null && cf.participants_hidden;
+            }
+            if (shouldSearchHistory) {
+                scanHistory(dialogId, scanTargetId, account, processedUids);
+            }
+        }
+
+        // Phase 3: Recent Members (pages of 200, up to 1000 members)
         int offset = 0;
-        int maxPages = 3;
+        int maxPages = 5;
         for (int page = 0; page < maxPages; page++) {
+            if (!loaded) break;
             final List<Long> pageUids = new ArrayList<>();
             final Object pageLock = new Object();
             final boolean[] endReached = new boolean[]{false};
@@ -861,18 +931,6 @@ public class Main {
             }
             checkUserIds(dialogId, account, toCheck);
             offset += 200;
-        }
-
-        // Phase 3: History Search (if enabled)
-        if (loadFromHistory) {
-            boolean shouldSearchHistory = true;
-            if (onlyIfHidden) {
-                TLRPC.ChatFull cf = mc.getChatFull(scanTargetId);
-                shouldSearchHistory = cf != null && cf.participants_hidden;
-            }
-            if (shouldSearchHistory) {
-                scanHistory(dialogId, scanTargetId, account, processedUids);
-            }
         }
     }
 
@@ -954,16 +1012,19 @@ public class Main {
     private static void checkUserIds(final long dialogId, final int account, List<Long> uids) {
         if (uids == null || uids.isEmpty()) return;
         final MessagesController mc = MessagesController.getInstance(account);
+        final MessagesStorage storage = MessagesStorage.getInstance(account);
         List<Long> needFetch = new ArrayList<>();
+        long now = SystemClock.elapsedRealtime();
 
         for (Long uid : uids) {
             if (uid == null || uid <= 0) continue;
-            if (noChannelCache.contains(uid)) continue;
+            Long until = noChannelUntil.get(uid);
+            if (until != null && now < until) continue;
 
             // In-memory check: bot, deleted, support
             TLRPC.User user = mc.getUser(uid);
             if (user != null && (user.bot || user.deleted || user.support)) {
-                noChannelCache.add(uid);
+                noChannelUntil.put(uid, now + 86400_000L); // 24h for bots
                 continue;
             }
 
@@ -981,7 +1042,7 @@ public class Main {
                     userChannelCache.put(uid, uf.personal_channel_id);
                     addDiscoveredChannel(dialogId, uid, uf.personal_channel_id, account);
                 } else {
-                    noChannelCache.add(uid);
+                    noChannelUntil.put(uid, now + 1800_000L); // 30m
                 }
                 continue;
             }
@@ -991,20 +1052,54 @@ public class Main {
 
         if (needFetch.isEmpty()) return;
 
-        // Process in parallel with up to 6 concurrent requests
-        final int concurrency = 6;
-        final AtomicInteger index = new AtomicInteger(0);
-        final int total = needFetch.size();
+        // Controlled concurrency: 2 concurrent requests with adaptive spacing
+        final int concurrency = 2;
+        final List<Long> queue = Collections.synchronizedList(new ArrayList<>(needFetch));
         final Object doneLock = new Object();
         final AtomicInteger inflight = new AtomicInteger(0);
+        final AtomicLong floodWaitUntil = new AtomicLong(0);
+        final AtomicInteger dispatchDelayMs = new AtomicInteger(150);
 
-        while (index.get() < total || inflight.get() > 0) {
-            while (inflight.get() < concurrency && index.get() < total) {
-                final long uid = needFetch.get(index.getAndIncrement());
+        while ((!queue.isEmpty() || inflight.get() > 0) && loaded) {
+            long currentNow = SystemClock.elapsedRealtime();
+            long waitFlood = floodWaitUntil.get() - currentNow;
+            if (waitFlood > 0) {
+                if (waitFlood > 45_000L) {
+                    Log.w(TAG, "FLOOD_WAIT too long (" + waitFlood + "ms), stopping member check");
+                    break;
+                }
+                try {
+                    Thread.sleep(Math.min(waitFlood, 35_000L));
+                } catch (InterruptedException ignored) {}
+                continue;
+            }
+
+            while (inflight.get() < concurrency && !queue.isEmpty() && loaded) {
+                if (floodWaitUntil.get() > SystemClock.elapsedRealtime()) {
+                    break;
+                }
+                final long uid = queue.remove(0);
+
+                TLRPC.InputUser inputUser = mc.getInputUser(uid);
+                if (inputUser == null || inputUser.user_id == 0) {
+                    TLRPC.User u = mc.getUser(uid);
+                    if (u == null) {
+                        u = storage.getUser(uid);
+                        if (u != null) {
+                            mc.putUser(u, true);
+                            inputUser = mc.getInputUser(u);
+                        }
+                    }
+                }
+                if (inputUser == null || inputUser.user_id == 0) {
+                    // Cannot query without access hash, skip without poisoning cache
+                    continue;
+                }
+
                 inflight.incrementAndGet();
 
                 TLRPC.TL_users_getFullUser req = new TLRPC.TL_users_getFullUser();
-                req.id = mc.getInputUser(uid);
+                req.id = inputUser;
 
                 ConnectionsManager.getInstance(account).sendRequest(req, new RequestDelegate() {
                     @Override
@@ -1022,17 +1117,17 @@ public class Main {
                                     userChannelCache.put(uid, pcid);
                                     addDiscoveredChannel(dialogId, uid, pcid, account);
                                 } else {
-                                    noChannelCache.add(uid);
+                                    noChannelUntil.put(uid, SystemClock.elapsedRealtime() + 1800_000L);
                                 }
                             } else if (error != null) {
                                 String text = error.text != null ? error.text : "";
                                 if (text.startsWith("FLOOD_WAIT_")) {
                                     try {
                                         int sec = Integer.parseInt(text.replace("FLOOD_WAIT_", ""));
-                                        Thread.sleep(Math.min(sec, 30) * 1000L);
+                                        floodWaitUntil.set(SystemClock.elapsedRealtime() + (sec + 1) * 1000L);
+                                        dispatchDelayMs.set(Math.min(dispatchDelayMs.get() + 150, 600));
+                                        queue.add(uid);
                                     } catch (Throwable ignored) {}
-                                } else {
-                                    noChannelCache.add(uid);
                                 }
                             }
                         } catch (Throwable t) {
@@ -1045,6 +1140,11 @@ public class Main {
                         }
                     }
                 });
+
+                // Gentle adaptive spacing between request dispatches
+                try {
+                    Thread.sleep(dispatchDelayMs.get());
+                } catch (InterruptedException ignored) {}
             }
 
             synchronized (doneLock) {
@@ -1055,7 +1155,7 @@ public class Main {
         }
     }
 
-    private static synchronized void addDiscoveredChannel(long dialogId, long uid, long channelId, int account) {
+    private static synchronized void addDiscoveredChannel(final long dialogId, final long uid, final long channelId, final int account) {
         if (channelId == 0) return;
         List<ChannelEntry> list = chatChannels.get(dialogId);
         if (list == null) {
@@ -1073,26 +1173,36 @@ public class Main {
             }
         }
 
-        MessagesController mc = MessagesController.getInstance(account);
+        final MessagesController mc = MessagesController.getInstance(account);
         TLRPC.Chat chat = mc.getChat(channelId);
         if (chat == null) {
-            // Channel not in memory yet, ask server
-            TLRPC.TL_channels_getFullChannel req = new TLRPC.TL_channels_getFullChannel();
-            TLRPC.TL_inputChannel inp = new TLRPC.TL_inputChannel();
-            inp.channel_id = channelId;
-            req.channel = inp;
-            ConnectionsManager.getInstance(account).sendRequest(req, new RequestDelegate() {
-                @Override
-                public void run(TLObject response, TLRPC.TL_error error) {
-                    if (response instanceof TLRPC.TL_messages_chatFull) {
-                        TLRPC.TL_messages_chatFull mcf = (TLRPC.TL_messages_chatFull) response;
-                        for (int i = 0; i < mcf.chats.size(); i++) {
-                            mc.putChat(mcf.chats.get(i), false);
+            chat = MessagesStorage.getInstance(account).getChat(channelId);
+            if (chat != null) {
+                mc.putChat(chat, true);
+            }
+        }
+
+        if (chat == null) {
+            // Channel not in memory or storage, request UserFull for uid to get channel object with access_hash
+            TLRPC.InputUser inputUser = mc.getInputUser(uid);
+            if (inputUser != null && inputUser.user_id != 0) {
+                TLRPC.TL_users_getFullUser req = new TLRPC.TL_users_getFullUser();
+                req.id = inputUser;
+                ConnectionsManager.getInstance(account).sendRequest(req, new RequestDelegate() {
+                    @Override
+                    public void run(TLObject response, TLRPC.TL_error error) {
+                        if (response instanceof TLRPC.TL_users_userFull) {
+                            TLRPC.TL_users_userFull ufull = (TLRPC.TL_users_userFull) response;
+                            if (ufull.chats != null) {
+                                for (int i = 0; i < ufull.chats.size(); i++) {
+                                    mc.putChat(ufull.chats.get(i), false);
+                                }
+                            }
+                            addDiscoveredChannel(dialogId, uid, channelId, account);
                         }
-                        addDiscoveredChannel(dialogId, uid, channelId, account);
                     }
-                }
-            });
+                });
+            }
             return;
         }
 
@@ -1121,7 +1231,7 @@ public class Main {
                         layout.updateData();
                         updateTabText(sml, dialogId);
                         BaseFragment pa = getProfileActivity(sml);
-                        if (pa instanceof ProfileActivity) {
+                        if (pa instanceof ProfileActivity && isOurTabActive(sml)) {
                             updateProfileCounter((ProfileActivity) pa, sml, dialogId);
                         }
                     }
@@ -1164,21 +1274,72 @@ public class Main {
         }
     }
 
+    public static String formatChannelsCount(int count) {
+        String l = lang;
+        if (l == null) l = "ru";
+        boolean isRu = "ru".equalsIgnoreCase(l);
+        if (isRu) {
+            int rem100 = count % 100;
+            int rem10 = count % 10;
+            String word;
+            if (rem100 >= 11 && rem100 <= 19) {
+                word = get("channels_count_many", "каналов");
+            } else if (rem10 == 1) {
+                word = get("channels_count_one", "канал");
+            } else if (rem10 >= 2 && rem10 <= 4) {
+                word = get("channels_count_few", "канала");
+            } else {
+                word = get("channels_count_many", "каналов");
+            }
+            return count + " " + word;
+        } else {
+            String word = count == 1 ? get("channels_count_one", "channel") : get("channels_count_many", "channels");
+            return count + " " + word;
+        }
+    }
+
     private static void updateProfileCounter(ProfileActivity pa, SharedMediaLayout sml, long dialogId) {
-        AudioPlayerAlert.ClippingTextViewSwitcher counterView = getMediaCounterTextView(pa);
-        if (counterView == null) return;
+        if (pa == null) return;
 
         boolean scanning = scanningChats.contains(dialogId);
         List<ChannelEntry> list = chatChannels.get(dialogId);
         int count = list != null ? list.size() : 0;
 
+        String counterText;
         if (scanning) {
-            String text = get("tab_label", "Channels") + " (" + get("scanning", "Scanning...") + (count > 0 ? " " + count : "") + ")";
-            counterView.setText(text);
+            if (count > 0) {
+                counterText = formatChannelsCount(count) + " (" + get("scanning", "Scanning...") + ")";
+            } else {
+                counterText = get("tab_label", "Channels") + " (" + get("scanning", "Scanning...") + ")";
+            }
         } else if (count > 0) {
-            counterView.setText(LocaleController.formatPluralString("Channels", count));
+            counterText = formatChannelsCount(count);
         } else {
-            counterView.setText(get("tab_label", "Channels"));
+            counterText = get("tab_label", "Channels");
+        }
+
+        if (!paSetMediaCounterTextChecked) {
+            paSetMediaCounterTextChecked = true;
+            try {
+                paSetMediaCounterTextMethod = ProfileActivity.class.getDeclaredMethod("setMediaCounterText", CharSequence.class);
+                paSetMediaCounterTextMethod.setAccessible(true);
+            } catch (Throwable ignored) {
+                paSetMediaCounterTextMethod = null;
+            }
+        }
+
+        if (paSetMediaCounterTextMethod != null) {
+            try {
+                paSetMediaCounterTextMethod.invoke(pa, counterText);
+                return;
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to invoke setMediaCounterText", t);
+            }
+        }
+
+        AudioPlayerAlert.ClippingTextViewSwitcher counterView = getMediaCounterTextView(pa);
+        if (counterView != null) {
+            counterView.setText(counterText, false);
         }
     }
 
@@ -1205,25 +1366,31 @@ public class Main {
     }
 
     private static BaseFragment getProfileActivity(SharedMediaLayout sml) {
+        if (sml == null) return null;
+        ProfileActivity mapped = smlToProfile.get(sml);
+        if (mapped != null) return mapped;
         try {
             if (smlProfileActivityField == null) {
                 smlProfileActivityField = SharedMediaLayout.class.getDeclaredField("profileActivity");
                 smlProfileActivityField.setAccessible(true);
             }
             return (BaseFragment) smlProfileActivityField.get(sml);
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to get profileActivity", t);
             return null;
         }
     }
 
     private static AudioPlayerAlert.ClippingTextViewSwitcher getMediaCounterTextView(ProfileActivity pa) {
+        if (pa == null) return null;
         try {
             if (paMediaCounterField == null) {
                 paMediaCounterField = ProfileActivity.class.getDeclaredField("mediaCounterTextView");
                 paMediaCounterField.setAccessible(true);
             }
             return (AudioPlayerAlert.ClippingTextViewSwitcher) paMediaCounterField.get(pa);
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to get mediaCounterTextView", t);
             return null;
         }
     }
@@ -1237,6 +1404,10 @@ public class Main {
         SharedPreferences prefs = getPrefs();
         if (prefs == null) return;
         try {
+            // Clean up old poisonous no_channels from disk
+            if (prefs.contains("no_channels")) {
+                prefs.edit().remove("no_channels").apply();
+            }
             String ucStr = prefs.getString("user_channels", null);
             if (ucStr != null) {
                 JSONObject obj = new JSONObject(ucStr);
@@ -1246,13 +1417,6 @@ public class Main {
                         String k = names.getString(i);
                         userChannelCache.put(Long.parseLong(k), obj.getLong(k));
                     }
-                }
-            }
-            String ncStr = prefs.getString("no_channels", null);
-            if (ncStr != null) {
-                JSONArray arr = new JSONArray(ncStr);
-                for (int i = 0; i < arr.length(); i++) {
-                    noChannelCache.add(arr.getLong(i));
                 }
             }
         } catch (Throwable t) {
@@ -1270,15 +1434,9 @@ public class Main {
                 ucObj.put(String.valueOf(entry.getKey()), entry.getValue());
                 if (++count > 5000) break;
             }
-            JSONArray ncArr = new JSONArray();
-            count = 0;
-            for (Long uid : noChannelCache) {
-                ncArr.put(uid);
-                if (++count > 5000) break;
-            }
             prefs.edit()
                 .putString("user_channels", ucObj.toString())
-                .putString("no_channels", ncArr.toString())
+                .remove("no_channels")
                 .apply();
         } catch (Throwable t) {
             Log.e(TAG, "Failed to save global cache", t);
@@ -1297,11 +1455,28 @@ public class Main {
             List<ChannelEntry> entries = new CopyOnWriteArrayList<>();
             int account = UserConfig.selectedAccount;
             MessagesController mc = MessagesController.getInstance(account);
+            MessagesStorage storage = MessagesStorage.getInstance(account);
 
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject obj = arr.getJSONObject(i);
                 long cid = obj.getLong("cid");
                 TLRPC.Chat chat = mc.getChat(cid);
+                if (chat == null) {
+                    chat = storage.getChat(cid);
+                    if (chat != null) {
+                        mc.putChat(chat, true);
+                    }
+                }
+                if (chat == null && obj.has("title")) {
+                    TLRPC.TL_channel fallbackChat = new TLRPC.TL_channel();
+                    fallbackChat.id = cid;
+                    fallbackChat.access_hash = obj.optLong("access_hash", 0);
+                    fallbackChat.title = obj.optString("title", "");
+                    fallbackChat.username = obj.optString("username", "");
+                    fallbackChat.participants_count = obj.optInt("subs", 0);
+                    chat = fallbackChat;
+                    mc.putChat(chat, false);
+                }
                 if (chat != null) {
                     ChannelEntry e = new ChannelEntry();
                     e.channelId = cid;
@@ -1330,14 +1505,20 @@ public class Main {
         if (prefs == null) return;
         try {
             if (list == null || list.isEmpty()) {
-                prefs.edit().remove("chat_" + dialogId).apply();
+                if (!scanningChats.contains(dialogId)) {
+                    prefs.edit().remove("chat_" + dialogId).apply();
+                }
                 return;
             }
             JSONArray arr = new JSONArray();
             for (ChannelEntry e : list) {
+                if (e.chat == null) continue;
                 JSONObject obj = new JSONObject();
                 obj.put("cid", e.channelId);
                 obj.put("subs", e.subscribersCount);
+                obj.put("title", e.chat.title != null ? e.chat.title : "");
+                obj.put("username", e.chat.username != null ? e.chat.username : "");
+                obj.put("access_hash", e.chat.access_hash);
                 JSONArray owners = new JSONArray();
                 for (Long uid : e.ownerUids) {
                     owners.put(uid);
@@ -1354,9 +1535,12 @@ public class Main {
     public static String get(String key, String fallback) {
         if ("ru".equals(lang)) {
             if ("tab_label".equals(key)) return "Каналы";
+            if ("channels_count_one".equals(key)) return "канал";
+            if ("channels_count_few".equals(key)) return "канала";
+            if ("channels_count_many".equals(key)) return "каналов";
             if ("channel_owners".equals(key)) return "Владельцы канала";
             if ("close".equals(key)) return "Закрыть";
-            if ("scanning".equals(key)) return "Поиск...";
+            if ("scanning".equals(key)) return "поиск...";
             if ("scanning_title".equals(key)) return "Идет поиск каналов участников...";
             if ("scanning_sub".equals(key)) return "Персональные каналы появятся здесь автоматически";
             if ("no_channels".equals(key)) return "Каналы участников не найдены";
@@ -1366,9 +1550,11 @@ public class Main {
             if ("channel".equals(key)) return "Канал";
         } else {
             if ("tab_label".equals(key)) return "Channels";
+            if ("channels_count_one".equals(key)) return "channel";
+            if ("channels_count_many".equals(key)) return "channels";
             if ("channel_owners".equals(key)) return "Channel owners";
             if ("close".equals(key)) return "Close";
-            if ("scanning".equals(key)) return "Scanning...";
+            if ("scanning".equals(key)) return "scanning...";
             if ("scanning_title".equals(key)) return "Scanning chat members...";
             if ("scanning_sub".equals(key)) return "Personal channels will appear here automatically";
             if ("no_channels".equals(key)) return "No channels found";

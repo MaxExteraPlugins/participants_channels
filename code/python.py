@@ -13,7 +13,7 @@ __id__ = "participants_channels"
 __name__ = "Participants Channels"
 __description__ = "Adds a native Channels tab to group and channel profiles showing participants' personal channels.\n\nTap a channel = open channel.\nLong press = open owner profile."
 __author__ = "@itNotMax - @MaxExteraPlugins"
-__version__ = "5.2.3"
+__version__ = "5.8"
 __icon__ = "MaxExteraPluginsStickers/19"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.1.1"
@@ -23,12 +23,14 @@ ENTRY_CLASS = "com.exteraplugins.participants_channels.Main"
 DEX_BEGIN = "__DEX_BEGIN__"
 DEX_END = "__DEX_END__"
 
-DEFAULT_HISTORY_LIMIT = 100
+DEFAULT_HISTORY_LIMIT = 300
 MAX_HISTORY_LIMIT = 50000
 
 STRINGS = {
     "en": {
         "tab_label": "Channels",
+        "channels_count_one": "channel",
+        "channels_count_many": "channels",
         "localization": "Localization",
         "language": "Language",
         "info": "Information",
@@ -40,12 +42,15 @@ STRINGS = {
         "only_if_hidden": "Only if members list is hidden",
         "only_if_hidden_sub": "History search will only run in chats where members list is hidden",
         "history_limit": "History scan limit",
-        "history_limit_sub": "Maximum number of recent messages to inspect for sender personal channels (recommended: 500-2000).",
+        "history_limit_sub": "Maximum number of recent messages to inspect for sender personal channels (recommended: 300-2000).",
         "channel_owners": "Channel owners",
         "close": "Close",
     },
     "ru": {
         "tab_label": "Каналы",
+        "channels_count_one": "канал",
+        "channels_count_few": "канала",
+        "channels_count_many": "каналов",
         "localization": "Локализация",
         "language": "Язык",
         "info": "Информация",
@@ -57,7 +62,7 @@ STRINGS = {
         "only_if_hidden": "Только если скрыт список участников",
         "only_if_hidden_sub": "Поиск в истории будет запускаться только в чатах, где скрыт список участников",
         "history_limit": "Лимит сообщений из истории",
-        "history_limit_sub": "Сколько последних сообщений проверять на наличие персональных каналов у их авторов (рекомендуется: 500-2000).",
+        "history_limit_sub": "Сколько последних сообщений проверять на наличие персональных каналов у их авторов (рекомендуется: 300-2000).",
         "channel_owners": "Владельцы канала",
         "close": "Закрыть",
     },
@@ -68,6 +73,10 @@ LANG_CODES = ["ru", "en"]
 
 
 def _read_dex_payload():
+    _dex_b64 = globals().get("_DEX_PAYLOAD")
+    if _dex_b64:
+        import base64, zlib
+        return zlib.decompress(base64.b64decode(_dex_b64))
     with open(__file__, "r", encoding="utf-8") as f:
         text = f.read()
     if ("# " + DEX_BEGIN) not in text or ("# " + DEX_END) not in text:
@@ -739,7 +748,7 @@ class GroupChannelsTabPlugin(BasePlugin):
         try:
             payload = json.dumps({
                 "lang": self._lang(),
-                "load_from_history": bool(self.get_setting("load_from_history", False)),
+                "load_from_history": bool(self.get_setting("load_from_history", True)),
                 "only_if_hidden": bool(self.get_setting("only_if_hidden", False)),
                 "history_limit": int(self._get_history_limit()),
             })
@@ -827,7 +836,7 @@ class GroupChannelsTabPlugin(BasePlugin):
                 key="load_from_history",
                 text=self._t("load_from_history"),
                 subtext=self._t("load_from_history_sub"),
-                default=False,
+                default=True,
                 on_change=self._on_setting_changed,
             ),
             Switch(
