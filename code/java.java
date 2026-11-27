@@ -728,10 +728,17 @@ public class Main {
             if (!entry.ownerUids.isEmpty()) {
                 MessagesController mc = MessagesController.getInstance(layout.account);
                 if (entry.ownerUids.size() == 1) {
-                    TLRPC.User owner = mc.getUser(entry.ownerUids.get(0));
+                    long ownerUid = entry.ownerUids.get(0);
+                    TLRPC.User owner = mc.getUser(ownerUid);
+                    if (owner == null) {
+                        owner = MessagesStorage.getInstance(layout.account).getUser(ownerUid);
+                        if (owner != null) {
+                            mc.putUser(owner, true);
+                        }
+                    }
                     String name = owner != null ? UserObject.getUserName(owner) : null;
                     if (!TextUtils.isEmpty(name)) {
-                        subtitle.append(" • ").append(get("owner_prefix", "Owner: ")).append(name);
+                        subtitle.append(" • ").append(name);
                     }
                 } else {
                     subtitle.append(" • ").append(entry.ownerUids.size()).append(" ").append(get("owners", "owners"));
@@ -747,11 +754,29 @@ public class Main {
     // Fast Scanner Logic
     // ============================================================
 
-    private static void ensureScanStarted(long dialogId, int account) {
+    private static void ensureScanStarted(final long dialogId, final int account) {
         loadChatCache(dialogId);
         Long lastTime = lastScanTime.get(dialogId);
         long now = SystemClock.elapsedRealtime();
         if (lastTime != null && (now - lastTime) < 180000) { // 3 minutes cache
+            List<ChannelEntry> list = chatChannels.get(dialogId);
+            if (list != null && !list.isEmpty()) {
+                boolean needsRefresh = false;
+                for (ChannelEntry e : list) {
+                    if (e.chat == null || e.chat.photo == null || e.subscribersCount <= 0) {
+                        needsRefresh = true;
+                        break;
+                    }
+                }
+                if (needsRefresh) {
+                    scanExecutor.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            refreshChannelsMetadata(dialogId, account);
+                        }
+                    });
+                }
+            }
             return;
         }
         if (scanningChats.contains(dialogId)) {
@@ -931,6 +956,145 @@ public class Main {
             }
             checkUserIds(dialogId, account, toCheck);
             offset += 200;
+        }
+
+        refreshChannelsMetadata(dialogId, account);
+    }
+
+    private static void refreshChannelsMetadata(final long dialogId, final int account) {
+        List<ChannelEntry> list = chatChannels.get(dialogId);
+        if (list == null || list.isEmpty() || !loaded) return;
+
+        final MessagesController mc = MessagesController.getInstance(account);
+        List<ChannelEntry> needChatRefresh = new ArrayList<>();
+        for (ChannelEntry e : list) {
+            if (e.chat == null || e.chat.photo == null || e.subscribersCount <= 0) {
+                if (e.chat != null && e.chat.access_hash != 0) {
+                    needChatRefresh.add(e);
+                }
+            }
+        }
+        if (needChatRefresh.isEmpty()) return;
+
+        // Step 1: Batch refresh via channels.getChannels (50 per request)
+        for (int start = 0; start < needChatRefresh.size() && loaded; start += 50) {
+            int end = Math.min(start + 50, needChatRefresh.size());
+            List<ChannelEntry> batch = needChatRefresh.subList(start, end);
+            org.telegram.tgnet.TLObject req;
+            try {
+                Class<?> cls = Class.forName("org.telegram.tgnet.TLRPC$TL_channels_getChannels");
+                req = (org.telegram.tgnet.TLObject) cls.getDeclaredConstructor().newInstance();
+                @SuppressWarnings("unchecked")
+                java.util.ArrayList<TLRPC.InputChannel> idList = (java.util.ArrayList<TLRPC.InputChannel>) cls.getField("id").get(req);
+                for (ChannelEntry e : batch) {
+                    TLRPC.TL_inputChannel inp = new TLRPC.TL_inputChannel();
+                    inp.channel_id = e.channelId;
+                    inp.access_hash = e.chat.access_hash;
+                    idList.add(inp);
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to build TL_channels_getChannels", t);
+                break;
+            }
+
+            final Object lock = new Object();
+            final boolean[] changed = new boolean[]{false};
+            ConnectionsManager.getInstance(account).sendRequest(req, new RequestDelegate() {
+                @Override
+                public void run(TLObject response, TLRPC.TL_error error) {
+                    if (response instanceof TLRPC.messages_Chats) {
+                        TLRPC.messages_Chats res = (TLRPC.messages_Chats) response;
+                        if (res.chats != null) {
+                            for (int i = 0; i < res.chats.size(); i++) {
+                                TLRPC.Chat c = res.chats.get(i);
+                                mc.putChat(c, false);
+                                for (ChannelEntry entry : list) {
+                                    if (entry.channelId == c.id) {
+                                        entry.chat = c;
+                                        if (c.participants_count > entry.subscribersCount) {
+                                            entry.subscribersCount = c.participants_count;
+                                        }
+                                        changed[0] = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    synchronized (lock) {
+                        lock.notifyAll();
+                    }
+                }
+            });
+
+            synchronized (lock) {
+                try {
+                    lock.wait(5000);
+                } catch (InterruptedException ignored) {}
+            }
+
+            if (changed[0]) {
+                Collections.sort(list, (a, b) -> Integer.compare(b.subscribersCount, a.subscribersCount));
+                notifyChannelsUpdated(dialogId);
+                saveChatCache(dialogId);
+            }
+        }
+
+        // Step 2: For the few channels that still have subscribersCount <= 0, fetch FullChannel
+        int fullChecked = 0;
+        for (final ChannelEntry e : list) {
+            if (!loaded || fullChecked >= 25) break;
+            if (e.subscribersCount > 0 || e.chat == null || e.chat.access_hash == 0) continue;
+            fullChecked++;
+
+            TLRPC.TL_channels_getFullChannel req = new TLRPC.TL_channels_getFullChannel();
+            TLRPC.TL_inputChannel inp = new TLRPC.TL_inputChannel();
+            inp.channel_id = e.channelId;
+            inp.access_hash = e.chat.access_hash;
+            req.channel = inp;
+
+            final Object lock = new Object();
+            final boolean[] changed = new boolean[]{false};
+            ConnectionsManager.getInstance(account).sendRequest(req, new RequestDelegate() {
+                @Override
+                public void run(TLObject response, TLRPC.TL_error error) {
+                    if (response instanceof TLRPC.TL_messages_chatFull) {
+                        TLRPC.TL_messages_chatFull mcf = (TLRPC.TL_messages_chatFull) response;
+                        if (mcf.chats != null) {
+                            for (int i = 0; i < mcf.chats.size(); i++) {
+                                TLRPC.Chat c = mcf.chats.get(i);
+                                mc.putChat(c, false);
+                                if (c.id == e.channelId) {
+                                    e.chat = c;
+                                }
+                            }
+                        }
+                        if (mcf.full_chat != null && mcf.full_chat.participants_count > 0) {
+                            e.subscribersCount = mcf.full_chat.participants_count;
+                            changed[0] = true;
+                        }
+                    }
+                    synchronized (lock) {
+                        lock.notifyAll();
+                    }
+                }
+            });
+
+            synchronized (lock) {
+                try {
+                    lock.wait(4000);
+                } catch (InterruptedException ignored) {}
+            }
+
+            if (changed[0]) {
+                Collections.sort(list, (a, b) -> Integer.compare(b.subscribersCount, a.subscribersCount));
+                notifyChannelsUpdated(dialogId);
+                saveChatCache(dialogId);
+            }
+
+            try {
+                Thread.sleep(150);
+            } catch (InterruptedException ignored) {}
         }
     }
 
@@ -1163,24 +1327,42 @@ public class Main {
             chatChannels.put(dialogId, list);
         }
 
+        final MessagesController mc = MessagesController.getInstance(account);
+        TLRPC.Chat freshChat = mc.getChat(channelId);
+        if (freshChat == null) {
+            freshChat = MessagesStorage.getInstance(account).getChat(channelId);
+            if (freshChat != null) {
+                mc.putChat(freshChat, true);
+            }
+        }
+
         for (ChannelEntry entry : list) {
             if (entry.channelId == channelId) {
+                boolean updated = false;
                 if (!entry.ownerUids.contains(uid)) {
                     entry.ownerUids.add(uid);
+                    updated = true;
+                }
+                if (freshChat != null) {
+                    if (entry.chat == null || (entry.chat.photo == null && freshChat.photo != null)) {
+                        entry.chat = freshChat;
+                        updated = true;
+                    }
+                    if (freshChat.participants_count > entry.subscribersCount) {
+                        entry.subscribersCount = freshChat.participants_count;
+                        Collections.sort(list, (a, b) -> Integer.compare(b.subscribersCount, a.subscribersCount));
+                        updated = true;
+                    }
+                }
+                if (updated) {
                     notifyChannelsUpdated(dialogId);
+                    saveChatCache(dialogId);
                 }
                 return;
             }
         }
 
-        final MessagesController mc = MessagesController.getInstance(account);
-        TLRPC.Chat chat = mc.getChat(channelId);
-        if (chat == null) {
-            chat = MessagesStorage.getInstance(account).getChat(channelId);
-            if (chat != null) {
-                mc.putChat(chat, true);
-            }
-        }
+        TLRPC.Chat chat = freshChat;
 
         if (chat == null) {
             // Channel not in memory or storage, request UserFull for uid to get channel object with access_hash
@@ -1475,7 +1657,6 @@ public class Main {
                     fallbackChat.username = obj.optString("username", "");
                     fallbackChat.participants_count = obj.optInt("subs", 0);
                     chat = fallbackChat;
-                    mc.putChat(chat, false);
                 }
                 if (chat != null) {
                     ChannelEntry e = new ChannelEntry();
